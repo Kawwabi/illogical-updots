@@ -1505,7 +1505,24 @@ polkit.addRule(function(action, subject) {{
 
         def work():
             try:
-                cmd_str = f"exec {shlex.quote(path)}"
+                # Build command: if script isn't executable, run it via bash interpreter
+                if not os.path.exists(path):
+                    self._append_log(
+                        f"[post-script error] path does not exist: {path}\n"
+                    )
+                    return
+                if os.path.isdir(path):
+                    self._append_log(
+                        f"[post-script error] path is a directory: {path}\n"
+                    )
+                    return
+                if os.access(path, os.X_OK):
+                    cmd_str = f"exec {shlex.quote(path)}"
+                else:
+                    cmd_str = f"exec bash {shlex.quote(path)}"
+                    self._append_log(
+                        "[post-script] script not executable; running via bash interpreter\n"
+                    )
                 self._append_log(f"$ bash -lc {shlex.quote(cmd_str)}\n")
                 p = subprocess.Popen(
                     ["bash", "-lc", cmd_str],
