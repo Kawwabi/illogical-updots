@@ -56,7 +56,8 @@ def _load_settings() -> dict:
         "send_notifications": True,  # desktop notifications on finish
         "log_max_lines": 5000,  # trim logs to this many lines (0 to disable)
         "changes_lazy_load": True,  # lazy load commits with animations
-        "post_script_path": "",  # bash script to run after installer (pkexec)
+        "post_script_path": "",  # bash script to run after installer (no root)
+        "show_details_button": True,  # show 'Details…' button under banner
     }
     try:
         if os.path.isfile(SETTINGS_FILE):
@@ -235,7 +236,7 @@ class MainWindow(Gtk.ApplicationWindow):
         mi_settings.connect("activate", self.on_settings_clicked)
         menu.append(mi_settings)
 
-        mi_logs = Gtk.MenuItem(label="Logs")
+        mi_logs = Gtk.MenuItem(label="Git Logs")
         mi_logs.connect("activate", self.on_logs_clicked)
         menu.append(mi_logs)
 
@@ -283,6 +284,17 @@ class MainWindow(Gtk.ApplicationWindow):
         banner_box.set_hexpand(True)
         banner_box.set_vexpand(True)
         banner_box.pack_start(self.primary_label, True, True, 0)
+        # Small info button under banner (hidden by default; shown when updates exist)
+        self.small_info_btn = Gtk.Button(label="")
+        self.small_info_btn.set_relief(Gtk.ReliefStyle.NONE)
+        try:
+            self.small_info_btn.get_style_context().add_class("tiny-link")
+        except Exception:
+            pass
+        self.small_info_btn.set_halign(Gtk.Align.CENTER)
+        self.small_info_btn.connect("clicked", lambda _b: self._show_repo_info_dialog())
+        self.small_info_btn.hide()
+        banner_box.pack_start(self.small_info_btn, False, False, 0)
         content.pack_start(banner_box, True, True, 0)
 
         # Remove secondary details label (minimal fullscreen banner)
@@ -346,8 +358,27 @@ class MainWindow(Gtk.ApplicationWindow):
 
         log_sw = Gtk.ScrolledWindow()
         log_sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        log_sw.set_min_content_height(320)
         log_sw.add(self.log_view)
         log_box.pack_start(log_sw, True, True, 0)
+
+        # Interactive controls (entry + Y/N/Enter/Ctrl+C)
+        self.log_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.log_input_entry = Gtk.Entry()
+        self.log_input_entry.set_placeholder_text("Type input (Enter to send)")
+        self.log_input_entry.connect("activate", self._on_log_send)
+        self.log_controls.pack_start(self.log_input_entry, True, True, 0)
+        for label, payload in [("Y", "y\n"), ("N", "n\n"), ("Enter", "\n")]:
+            btn = Gtk.Button(label=label)
+            btn.connect("clicked", lambda _b, t=payload: self._send_to_proc(t))
+            self.log_controls.pack_start(btn, False, False, 0)
+        ctrlc_btn = Gtk.Button(label="Ctrl+C")
+        ctrlc_btn.connect("clicked", self._on_log_ctrl_c)
+        self.log_controls.pack_start(ctrlc_btn, False, False, 0)
+        log_box.pack_start(self.log_controls, False, False, 0)
+
+        # Key press mapping for quick Y/N/Enter when focus is in the log view
+        self.log_view.connect("key-press-event", self._on_log_key_press)
 
         self.log_revealer.add(log_frame)
         outer.pack_start(self.log_revealer, False, False, 0)
@@ -846,7 +877,7 @@ polkit.addRule(function(action, subject) {{
         if self._status and self._status.has_updates:
             if not ctx.has_class("suggested-action"):
                 ctx.add_class("suggested-action")  # typically blue in GTK themes
-            self.update_btn.set_label("Update available")
+            self.update_btn.set_label("Update")
             self.update_btn.set_tooltip_text("Pull latest updates from upstream")
         else:
             if ctx.has_class("suggested-action"):
@@ -889,11 +920,24 @@ polkit.addRule(function(action, subject) {{
                 f"<span size='xx-large' weight='bold'>Updates available</span>\n"
                 f"<span size='large'>{st.behind} new commit(s) to pull</span>"
             )
+            # Show small details link just below the banner
+            if (
+                hasattr(self, "small_info_btn")
+                and self.small_info_btn
+                and bool(SETTINGS.get("show_details_button", True))
+            ):
+                self.small_info_btn.set_label("Details…")
+                self.small_info_btn.show()
+            elif hasattr(self, "small_info_btn") and self.small_info_btn:
+                self.small_info_btn.hide()
         else:
             # ctx.add_class("status-ok")  # removed to avoid green styling
             self.primary_label.set_markup(
                 "<span size='xx-large' weight='bold'>Up to date</span>"
             )
+            # Hide small details link when up to date
+            if hasattr(self, "small_info_btn") and self.small_info_btn:
+                self.small_info_btn.hide()
 
         # Secondary details
         branch = st.branch or "(unknown)"
@@ -942,8 +986,12 @@ polkit.addRule(function(action, subject) {{
         self._busy(False, "")
 
     def _on_banner_clicked(self, _widget, _event) -> bool:
-        # Show detailed repo info dialog
-        self._show_repo_info_dialog()
+        # If updates are available, open the changes dialog; otherwise show repo info
+        st = getattr(self, "_status", None)
+        if st and st.has_updates:
+            on_view_changes_quick(self)
+        else:
+            self._show_repo_info_dialog()
         return True
 
     def _show_repo_info_dialog(self) -> None:
@@ -979,8 +1027,59 @@ polkit.addRule(function(action, subject) {{
         details_parts.append(remote_out.strip() or "(none)")
         if remote_err.strip():
             details_parts.append("stderr:\n" + remote_err.strip())
+        # Include pending commits and diffstat when updates are available
+        if st.has_updates and st.upstream:
+            log_rc, log_out, log_err = run_git(
+                [
+                    "log",
+                    "--pretty=format:%h %s | %an, %ad",
+                    "--date=short",
+                    f"HEAD..{st.upstream}",
+                ],
+                repo_path,
+            )
+            details_parts.append("\n== commits to pull ==")
+            details_parts.append(log_out.strip() or "(none)")
+            if log_err.strip():
+                details_parts.append("stderr:\n" + log_err.strip())
+            diff_rc, diff_out, diff_err = run_git(
+                ["diff", "--stat", f"HEAD..{st.upstream}"],
+                repo_path,
+            )
+            details_parts.append("\n== diff stat ==")
+            details_parts.append(diff_out.strip() or "(none)")
+            if diff_err.strip():
+                details_parts.append("stderr:\n" + diff_err.strip())
         details = "\n".join(details_parts)
-        show_details_dialog(self, "Repository Info", summary, details)
+        full_text = summary + "\n\n" + details
+
+        dialog = Gtk.Window(title="Details…")
+        dialog.set_transient_for(self)
+        dialog.set_modal(True)
+        dialog.set_default_size(900, 600)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(12)
+        dialog.add(outer)
+
+        header = Gtk.Label()
+        header.set_markup("<b>Repository Details</b>")
+        header.set_xalign(0.0)
+        outer.pack_start(header, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        outer.pack_start(sw, True, True, 0)
+
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_cursor_visible(False)
+        tv.set_monospace(True)
+        buf = tv.get_buffer()
+        buf.set_text(full_text)
+        sw.add(tv)
+
+        dialog.show_all()
 
     def on_refresh_clicked(self, _btn: Gtk.Button) -> None:
         self.refresh_status()
@@ -993,7 +1092,7 @@ polkit.addRule(function(action, subject) {{
 
     def _show_logs_dialog(self) -> None:
         if not self._update_logs:
-            show_details_dialog(self, "Logs", "No update logs yet.", "")
+            show_details_dialog(self, "Git Logs", "No update logs yet.", "")
             return
         brief_lines = [
             f"{ts} | {event} | {summary.splitlines()[0] if summary else ''}"
@@ -1139,9 +1238,18 @@ polkit.addRule(function(action, subject) {{
         changes_row.pack_start(cb_lazy, False, False, 0)
         box.pack_start(changes_row, False, False, 0)
 
-        # Post-install script (pkexec)
+        # Show 'Details…' button under banner
+        details_btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cb_details_btn = Gtk.CheckButton.new_with_label(
+            "Show 'Details…' button under banner"
+        )
+        cb_details_btn.set_active(bool(SETTINGS.get("show_details_button", True)))
+        details_btn_row.pack_start(cb_details_btn, False, False, 0)
+        box.pack_start(details_btn_row, False, False, 0)
+
+        # Post-install script
         post_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl_post = Gtk.Label(label="Post-install script (pkexec):")
+        lbl_post = Gtk.Label(label="Post-install script:")
         lbl_post.set_xalign(0.0)
         post_row.pack_start(lbl_post, False, False, 0)
         entry_post = Gtk.Entry()
@@ -1216,7 +1324,10 @@ polkit.addRule(function(action, subject) {{
             except Exception:
                 pass
             SETTINGS["changes_lazy_load"] = cb_lazy.get_active()
+            SETTINGS["show_details_button"] = cb_details_btn.get_active()
             SETTINGS["post_script_path"] = entry_post.get_text().strip()
+            # removed: ensure_polkit_agent (no longer used)
+            # removed: polkit_agent_cmd (no longer used)
             _save_settings(SETTINGS)
 
             REPO_PATH = str(
@@ -1239,8 +1350,7 @@ polkit.addRule(function(action, subject) {{
         repo_path = self._status.repo_path
 
         # Show embedded console and mark busy
-        if hasattr(self, "log_revealer"):
-            self.log_revealer.set_reveal_child(True)
+        self._ensure_console_open()
         self._busy(True, "Updating...")
 
         def stream(cmd: list[str], cwd: str) -> int:
@@ -1387,20 +1497,18 @@ polkit.addRule(function(action, subject) {{
             return
 
         # Reveal console for visibility
-        if hasattr(self, "log_revealer"):
-            try:
-                self.log_revealer.set_reveal_child(True)
-            except Exception:
-                pass
+        self._ensure_console_open()
 
-        self._append_log("\n=== POST-INSTALL SCRIPT (pkexec) ===\n")
+        self._append_log("\n=== POST-INSTALL SCRIPT ===\n")
+
+        # Running unprivileged; no polkit needed
 
         def work():
             try:
                 cmd_str = f"exec {shlex.quote(path)}"
-                self._append_log(f"$ pkexec bash -lc {shlex.quote(cmd_str)}\n")
+                self._append_log(f"$ bash -lc {shlex.quote(cmd_str)}\n")
                 p = subprocess.Popen(
-                    ["pkexec", "bash", "-lc", cmd_str],
+                    ["bash", "-lc", cmd_str],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -1420,7 +1528,37 @@ polkit.addRule(function(action, subject) {{
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _ensure_polkit_agent(self) -> None:
+        """
+        Removed: post-install runs unprivileged; no polkit agent handling needed.
+        """
+        return
+
     # Removed key press handler (console/shortcut no longer used)
+
+    def _ensure_console_open(self, desired_height: int = 320) -> None:
+        """
+        Ensure the embedded console is visible.
+        """
+        rev = getattr(self, "log_revealer", None)
+        if not rev:
+            return
+        try:
+            rev.set_reveal_child(True)
+            # Always show input controls when console visible
+            if hasattr(self, "log_controls") and self.log_controls:
+                self.log_controls.show_all()
+        except Exception:
+            pass
+
+    def toggle_console(self) -> None:
+        """
+        Toggle embedded console visibility.
+        """
+        rev = getattr(self, "log_revealer", None)
+        if not rev:
+            return
+        rev.set_reveal_child(not rev.get_reveal_child())
 
     def run_install_external(self) -> None:
         """
@@ -1775,7 +1913,7 @@ class SetupConsole(Gtk.Window):
 
     def _show_logs_dialog(self) -> None:
         if not self._update_logs:
-            show_details_dialog(self, "Logs", "No update logs yet.", "")
+            show_details_dialog(self, "Git Logs", "No update logs yet.", "")
             return
         # Brief list view
         brief_lines = [
@@ -1921,9 +2059,10 @@ def _init_log_css(self):
         margin-top: 6px;
         margin-bottom: 10px;
     }
-    .status-banner.status-up { color: #1e90ff; }
+    .status-banner.status-up { color: #ffffff; }
     /* status-ok styling removed to avoid green color */
     .status-banner.status-err { color: #ff4d4f; }
+    .tiny-link { font-size: 10px; padding: 0 4px; opacity: 0.85; }
     .ansi-bold     { font-weight: bold; }
     .ansi-dim      { opacity: 0.7; }
     .ansi-italic   { font-style: italic; }
@@ -1999,16 +2138,6 @@ def _append_log(self, text: str):
             # Swallow any GTK/Pango issues
             pass
         return False
-
-    try:
-        import threading
-
-        if threading.current_thread() is threading.main_thread():
-            do_append()
-        else:
-            GLib.idle_add(do_append)
-    except Exception:
-        pass
 
     try:
         import threading
@@ -2190,8 +2319,40 @@ def _spawn_setup_install(
                             logger(f"[auto-input-error] {_ex}\n")
                             break
                         _t.sleep(0.25)
+                    # After auto-enters, append yesforall
+                    try:
+                        yesforall = "yesforall\n"
+                        if master_fd is not None:
+                            os.write(master_fd, yesforall.encode("utf-8", "replace"))
+                        elif pipe:
+                            os.write(
+                                pipe.fileno(), yesforall.encode("utf-8", "replace")
+                            )
+                        logger(f"[auto-input] {repr(yesforall)}\n")
+                    except Exception as _ex:
+                        logger(f"[auto-input-error] {_ex}\n")
 
                 threading.Thread(target=_feed, daemon=True).start()
+            else:
+                # Even without an explicit auto_input_seq, send a trailing 'yesforall'
+                def _feed_yesforall():
+                    import os
+                    import time as _t
+
+                    _t.sleep(0.3)
+                    master_fd = getattr(p, "_pty_master_fd", None)
+                    pipe = p.stdin if master_fd is None else None
+                    try:
+                        msg = "yesforall\n"
+                        if master_fd is not None:
+                            os.write(master_fd, msg.encode("utf-8", "replace"))
+                        elif pipe:
+                            os.write(pipe.fileno(), msg.encode("utf-8", "replace"))
+                        logger(f"[auto-input] {repr(msg)}\n")
+                    except Exception as _ex:
+                        logger(f"[auto-input-error] {_ex}\n")
+
+                threading.Thread(target=_feed_yesforall, daemon=True).start()
 
             return p
         except OSError as ex:
