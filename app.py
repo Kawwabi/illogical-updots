@@ -2613,7 +2613,7 @@ class App(Gtk.Application):
                     t.join(timeout=1.0)
             except Exception:
                 pass
-        super().do_shutdown()
+        Gtk.Application.do_shutdown(self)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
