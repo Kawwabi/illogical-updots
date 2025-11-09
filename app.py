@@ -1119,8 +1119,7 @@ polkit.addRule(function(action, subject) {{
         subtitle = Gtk.Label()
         subtitle.set_use_markup(True)
         subtitle.set_markup(
-            "<span size='large'>A simple GTK3 app to check a git repo for updates, "
-            "show changes, and run your installer with an interactive console.</span>"
+            "<span size='large'>A simple End4 illogical-impulse dotfiles manager and updater.</span>"
         )
         subtitle.set_xalign(0.0)
         subtitle.set_line_wrap(True)
