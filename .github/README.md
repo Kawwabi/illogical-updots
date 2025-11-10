@@ -7,7 +7,7 @@
 
 ![](https://img.shields.io/github/last-commit/foxyiscoding/illogical-updots?&style=for-the-badge&color=8ad7eb&logo=git&logoColor=D9E0EE&labelColor=1E202B)
 ![](https://img.shields.io/github/stars/foxyiscoding/illogical-updots?style=for-the-badge&logo=andela&color=86dbd7&logoColor=D9E0EE&labelColor=1E202B)
-![](https://img.shields.io/github/repo-size/foxyiscoding/illogical-updots?color=86dbce&label=SIZE&logo=protondrive&style=for-the-badge&logoColor=D9E0EE&labelColor=1E202B)
+![AUR Version](https://img.shields.io/aur/version/illogical-updots?style=for-the-badge&logo=archlinux&logoColor=D9E0EE&labelColor=1E202B&color=86dbd7&link=https%3A%2F%2Faur.archlinux.org%2Fpackages%2Fillogical-updots)
 
 
 </div>
@@ -38,11 +38,10 @@
 </details>
 
   <summary>Installation</summary>
-  
-   - Current installation script  will clone the app into ~/.cache/illogical-updots and make a .desktop entry. if you dont want to install the app you can clone the repo and run app.py
-   - Just run `curl -sSL https://github.com/FoxyIsCoding/illogical-updots/raw/refs/heads/main/install.sh | bash
-`
-     - Or, clone this repo and run `app.py`
+
+  - We are on AUR so you can simply install it with yay or any aur helper.
+  - ``yay -S illogical-updots``
+  - Or, clone this repo and run `app.py`
 
 
 
