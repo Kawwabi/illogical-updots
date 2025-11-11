@@ -36,14 +36,14 @@ from gi.repository import (
     Pango,  # noqa: E402  # type: ignore
 )
 
+from dialogs.about import show_about_dialog
 from dialogs.changes import on_view_changes_quick
 from dialogs.details import show_repo_info_dialog
-from dialogs.about import show_about_dialog
 from dialogs.logs import show_logs_dialog
 from dialogs.settings import show_settings_dialog
-from widgets.console import SetupConsole
-from style.css import get_css
 from helpers.ansi import insert_ansi_formatted
+from style.css import get_css
+from widgets.console import SetupConsole
 
 APP_ID = "com.foxy.illogical-updots"
 APP_TITLE = "illogical-updots"
@@ -250,7 +250,9 @@ class MainWindow(Gtk.ApplicationWindow):
         # View changes button (commits to pull)
         self.view_btn = Gtk.Button(label="View changes")
         self.view_btn.set_tooltip_text("View commits to be pulled")
-        self.view_btn.connect("clicked", lambda _btn: on_view_changes_quick(self, run_git))
+        self.view_btn.connect(
+            "clicked", lambda _btn: on_view_changes_quick(self, run_git)
+        )
         # Reordered pack_end so right side shows: Update, View changes, Menu (dots)
         # Menu button (dropdown) with Settings and Logs
         menu = Gtk.Menu()
@@ -860,13 +862,141 @@ polkit.addRule(function(action, subject) {{
         self._append_log("Installer mode: files-only.\n")
         return [["./setup", "install-files"]]
 
+    def _check_and_handle_unmerged_conflicts(self, repo_path: str) -> bool:
+        """
+        Detect unresolved merge/rebase/cherry-pick conflicts before updating.
+        If detected, prompt the user to abort the in-progress operation(s).
+        Returns True if it is safe to continue with update, False to cancel.
+        """
+        # Check for unmerged files
+        rc_u, out_u, _ = run_git(["diff", "--name-only", "--diff-filter=U"], repo_path)
+        unmerged_files = [
+            ln for ln in (out_u.splitlines() if rc_u == 0 else []) if ln.strip()
+        ]
+
+        # Detect in-progress operations
+        merge_in_progress = (
+            subprocess.run(
+                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                cwd=repo_path,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).returncode
+            == 0
+        )
+        cherry_in_progress = (
+            subprocess.run(
+                ["git", "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"],
+                cwd=repo_path,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).returncode
+            == 0
+        )
+        # Rebase markers
+        rebase_in_progress = any(
+            os.path.isdir(os.path.join(repo_path, ".git", d))
+            for d in ("rebase-apply", "rebase-merge")
+        )
+
+        if not (
+            unmerged_files
+            or merge_in_progress
+            or rebase_in_progress
+            or cherry_in_progress
+        ):
+            return True  # safe to continue
+
+        # Prompt user to abort or cancel
+        msg = "Unresolved merge/rebase detected.\n\n"
+        if unmerged_files:
+            msg += f"Unmerged files: {len(unmerged_files)}\n"
+        if merge_in_progress:
+            msg += "A merge is in progress.\n"
+        if rebase_in_progress:
+            msg += "A rebase is in progress.\n"
+        if cherry_in_progress:
+            msg += "A cherry-pick is in progress.\n"
+        msg += "\nAbort the in-progress operation(s) and continue?"
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Conflicts detected",
+        )
+        dialog.format_secondary_text(msg)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Abort and continue", Gtk.ResponseType.OK)
+        resp = dialog.run()
+        dialog.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return False
+
+        # Attempt abort(s)
+        ok = True
+        if merge_in_progress:
+            self._append_log("[git] merge --abort\n")
+            r = subprocess.run(
+                ["git", "merge", "--abort"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode != 0:
+                ok = False
+                self._append_log(f"[git error] merge --abort: {r.stderr}\n")
+        if rebase_in_progress:
+            self._append_log("[git] rebase --abort\n")
+            r = subprocess.run(
+                ["git", "rebase", "--abort"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode != 0:
+                ok = False
+                self._append_log(f"[git error] rebase --abort: {r.stderr}\n")
+        if cherry_in_progress:
+            self._append_log("[git] cherry-pick --abort\n")
+            r = subprocess.run(
+                ["git", "cherry-pick", "--abort"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode != 0:
+                ok = False
+                self._append_log(f"[git error] cherry-pick --abort: {r.stderr}\n")
+
+        # Re-check unmerged files after abort attempts
+        rc_u2, out_u2, _ = run_git(
+            ["diff", "--name-only", "--diff-filter=U"], repo_path
+        )
+        still_unmerged = [
+            ln for ln in (out_u2.splitlines() if rc_u2 == 0 else []) if ln.strip()
+        ]
+        if still_unmerged:
+            ok = False
+            self._append_log(
+                "[git] Unmerged files still present after abort; canceling update.\n"
+            )
+            self._show_message(
+                Gtk.MessageType.ERROR,
+                "Unmerged files remain after abort. Resolve conflicts manually before updating.",
+            )
+
+        return ok
+
     def on_install_nerd_fonts_clicked(self, _item):
         self._show_nerd_fonts_dialog()
 
     def _run_update_without_pull(self) -> None:
-        # Backward compatibility: delegate to unified installer in test mode
-        plan_cmds = self._plan_install_commands()
-        self._run_installer_common(test_mode=True, commands=plan_cmds)
+        # Route to the same update flow as the Update button for consistency
+        self.on_update_clicked(None)
 
     def _on_key_press(self, _widget, event) -> bool:
         # Ctrl+I triggers test update (no git pull)
@@ -1053,7 +1183,9 @@ polkit.addRule(function(action, subject) {{
           VIEW
           POST ACTIONS
         """
-        show_settings_dialog(self, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _save_settings)
+        show_settings_dialog(
+            self, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _save_settings
+        )
 
     def on_update_clicked(self, _btn: Gtk.Button) -> None:
         # Allow update even when up to date (will run installer plan accordingly)
@@ -1062,6 +1194,14 @@ polkit.addRule(function(action, subject) {{
             self.refresh_status()
             return
         repo_path = self._status.repo_path
+
+        # Pre-check for unresolved conflicts/rebase in progress
+        if not self._check_and_handle_unmerged_conflicts(repo_path):
+            # User canceled or abort failed; do not proceed
+            self._append_log(
+                "[update] Aborted due to unresolved merge/rebase or user cancel.\n"
+            )
+            return
 
         # Show embedded console and mark busy
         self._ensure_console_open()
@@ -1148,6 +1288,8 @@ polkit.addRule(function(action, subject) {{
                         auto_input_seq=[],
                         use_pty=bool(SETTINGS.get("use_pty", True)),
                     )
+                    # Track current process so console input (Y/N/Enter) works
+                    self._current_proc = p
                     out = getattr(p, "stdout", None)
                     if p and out is not None:
                         for line in iter(out.readline, ""):
@@ -1156,6 +1298,7 @@ polkit.addRule(function(action, subject) {{
                             self._append_log(str(line))
                         rc = p.wait()
                         self._append_log(f"[installer exit {rc}]\n")
+                        self._current_proc = None
                         # Fallback: if install-files failed, retry plain install
                         if rc != 0 and "install-files" in extra_args:
                             self._append_log("[fallback] Retrying with 'install'...\n")
@@ -1167,6 +1310,8 @@ polkit.addRule(function(action, subject) {{
                                 auto_input_seq=[],
                                 use_pty=bool(SETTINGS.get("use_pty", True)),
                             )
+                            # Track fallback installer as current process as well
+                            self._current_proc = p2
                             out2 = getattr(p2, "stdout", None)
                             if p2 and out2 is not None:
                                 for line in iter(out2.readline, ""):
@@ -1175,6 +1320,7 @@ polkit.addRule(function(action, subject) {{
                                     self._append_log(str(line))
                                 rc2 = p2.wait()
                                 self._append_log(f"[installer exit {rc2}]\n")
+                            self._current_proc = None
                     else:
                         self._append_log("[warn] Installer spawn returned no stdout.\n")
                 except Exception as ex:
